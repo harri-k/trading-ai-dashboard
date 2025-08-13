@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 # Alpaca
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import QueryOrderStatus, OrderStatus
+from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -20,7 +20,6 @@ from alpaca.data.timeframe import TimeFrame
 
 # -------- Helpers: secrets/env ----------
 def env(name, default=None):
-    # Prefer Streamlit Cloud secrets
     if name in st.secrets:
         return st.secrets[name]
     return os.getenv(name, default)
@@ -41,19 +40,11 @@ st.set_page_config(page_title="TradingAI", layout="wide")
 st.title("TradingAI")
 st.caption("Live trades, equity, positions, and intraday charts. (Paper)")
 
-# Auto-refresh toggle
 st_autorefresh = st.sidebar.checkbox("Auto-refresh (15s)", value=True, help="Disable to pause updates")
 
-# Debug / status panel
 with st.sidebar.expander("Connection status", expanded=False):
-    st.write({
-        "has_API_key": bool(API),
-        "has_secret": bool(SEC),
-        "symbols": SYMBOLS,
-        "tz": TZNAME
-    })
+    st.write({"has_API_key": bool(API), "has_secret": bool(SEC), "symbols": SYMBOLS, "tz": TZNAME})
 
-# Guard: missing creds
 if not (API and SEC):
     st.error("Alpaca credentials not found. Set them in **Advanced settings → Secrets** on Streamlit Cloud.")
     st.stop()
@@ -94,13 +85,13 @@ try:
 except Exception as e:
     st.error(f"Positions error: {e}")
 
-# -------- Recent Orders (fixed API) ----------
+# -------- Recent Orders (FIXED: use QueryOrderStatus) ----------
 st.subheader("Recent Orders")
 try:
     req = GetOrdersRequest(
-        status=OrderStatus.ALL,   # or OrderStatus.CLOSED / OPEN
+        status=QueryOrderStatus.ALL,  # or QueryOrderStatus.CLOSED / OPEN
         limit=50,
-        nested=True               # include legs if any
+        nested=True
     )
     ords = trading.get_orders(filter=req)
     dfo = pd.DataFrame([{
@@ -115,23 +106,22 @@ try:
 except Exception as e:
     st.error(f"Orders error: {e}")
 
-# -------- Intraday chart (force IEX feed) ----------
+# -------- Intraday chart (IEX feed) ----------
 symbol = st.sidebar.selectbox("Chart Symbol", SYMBOLS, index=0 if SYMBOLS else None)
 if symbol:
     try:
         NY = pytz.timezone(TZNAME)
         end = datetime.now(NY)
-        start = end - timedelta(hours=7)  # ~one session
+        start = end - timedelta(hours=7)
 
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=TimeFrame.Minute,
             start=start,
             end=end,
-            feed="iex"  # force free IEX feed to avoid SIP restriction
+            feed="iex"  # avoid SIP restrictions
         )
         bars = dataapi.get_stock_bars(req).df
-
         if bars is not None and not bars.empty:
             if isinstance(bars.index, pd.MultiIndex):
                 bars = bars.xs(symbol, level=0)
@@ -150,7 +140,7 @@ if symbol:
     except Exception as e:
         st.error(f"Chart error for {symbol}: {e}")
 
-# -------- Safe auto-refresh (no experimental API) ----------
+# -------- Safe auto-refresh ----------
 if st_autorefresh:
     time.sleep(15)
     st.rerun()
