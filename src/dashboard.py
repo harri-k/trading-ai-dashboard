@@ -1,5 +1,6 @@
 ﻿# src/dashboard.py
 import os
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -11,19 +12,20 @@ from dotenv import load_dotenv
 
 # Alpaca
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import QueryOrderStatus
+from alpaca.trading.enums import QueryOrderStatus, OrderStatus
+from alpaca.trading.requests import GetOrdersRequest
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-# ---------- Config helpers ----------
+# -------- Helpers: secrets/env ----------
 def env(name, default=None):
-    # Prefer Streamlit Cloud secrets if present
+    # Prefer Streamlit Cloud secrets
     if name in st.secrets:
         return st.secrets[name]
     return os.getenv(name, default)
 
-# Local dev: load .env if no cloud secrets
+# Local dev: load .env if not on Streamlit Cloud
 if not st.secrets:
     ROOT = Path(__file__).resolve().parents[1]
     load_dotenv(dotenv_path=str(ROOT / "config" / ".env.paper"), override=True)
@@ -32,17 +34,17 @@ API = env("ALPACA_API_KEY")
 SEC = env("ALPACA_API_SECRET")
 BASE = env("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 SYMBOLS = [s.strip() for s in env("SYMBOLS", "SPY,AAPL,MSFT,QQQ,NVDA").split(",") if s.strip()]
-TZNAME  = env("MARKET_TIMEZONE", "America/New_York")
+TZNAME = env("MARKET_TIMEZONE", "America/New_York")
 
-# ---------- UI frame ----------
+# -------- UI frame ----------
 st.set_page_config(page_title="TradingAI", layout="wide")
 st.title("TradingAI")
 st.caption("Live trades, equity, positions, and intraday charts. (Paper)")
 
-# Simple auto-refresh every 15s
+# Auto-refresh toggle
 st_autorefresh = st.sidebar.checkbox("Auto-refresh (15s)", value=True, help="Disable to pause updates")
 
-# Debug panel (no secrets shown)
+# Debug / status panel
 with st.sidebar.expander("Connection status", expanded=False):
     st.write({
         "has_API_key": bool(API),
@@ -51,12 +53,12 @@ with st.sidebar.expander("Connection status", expanded=False):
         "tz": TZNAME
     })
 
-# Hard-stop with a helpful message if creds are missing
+# Guard: missing creds
 if not (API and SEC):
     st.error("Alpaca credentials not found. Set them in **Advanced settings → Secrets** on Streamlit Cloud.")
     st.stop()
 
-# ---------- Clients ----------
+# -------- Clients ----------
 try:
     trading = TradingClient(API, SEC, paper=True)
     dataapi = StockHistoricalDataClient(API, SEC)
@@ -64,7 +66,7 @@ except Exception as e:
     st.error(f"Failed to create Alpaca clients: {e}")
     st.stop()
 
-# ---------- Account metrics ----------
+# -------- Account metrics ----------
 try:
     acct = trading.get_account()
     c1, c2, c3 = st.columns(3)
@@ -74,7 +76,7 @@ try:
 except Exception as e:
     st.warning(f"Account fetch failed: {e}")
 
-# ---------- Positions ----------
+# -------- Positions ----------
 st.subheader("Open Positions")
 try:
     pos = trading.get_all_positions()
@@ -92,12 +94,17 @@ try:
 except Exception as e:
     st.error(f"Positions error: {e}")
 
-# ---------- Recent Orders ----------
+# -------- Recent Orders (fixed API) ----------
 st.subheader("Recent Orders")
 try:
-    ords = trading.get_orders(status=QueryOrderStatus.ALL, limit=50)
+    req = GetOrdersRequest(
+        status=OrderStatus.ALL,   # or OrderStatus.CLOSED / OPEN
+        limit=50,
+        nested=True               # include legs if any
+    )
+    ords = trading.get_orders(filter=req)
     dfo = pd.DataFrame([{
-        "Time": str(o.submitted_at)[:19],
+        "Time": (str(o.submitted_at)[:19] if o.submitted_at else ""),
         "Symbol": o.symbol,
         "Side": o.side,
         "Qty/Notional": o.qty or o.notional,
@@ -108,21 +115,23 @@ try:
 except Exception as e:
     st.error(f"Orders error: {e}")
 
-# ---------- Intraday chart ----------
+# -------- Intraday chart (force IEX feed) ----------
 symbol = st.sidebar.selectbox("Chart Symbol", SYMBOLS, index=0 if SYMBOLS else None)
 if symbol:
     try:
         NY = pytz.timezone(TZNAME)
         end = datetime.now(NY)
-        start = end - timedelta(hours=7)  # ~1 trading session
+        start = end - timedelta(hours=7)  # ~one session
 
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=TimeFrame.Minute,
             start=start,
-            end=end
+            end=end,
+            feed="iex"  # force free IEX feed to avoid SIP restriction
         )
         bars = dataapi.get_stock_bars(req).df
+
         if bars is not None and not bars.empty:
             if isinstance(bars.index, pd.MultiIndex):
                 bars = bars.xs(symbol, level=0)
@@ -134,13 +143,14 @@ if symbol:
                 close=bars['close']
             )])
             fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10))
-            st.subheader(f"{symbol} — Intraday (1-min)")
+            st.subheader(f"{symbol} — Intraday (1-min, IEX)")
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No intraday bars returned yet. Market closed or data delay.")
+            st.info("No intraday bars returned yet (market closed or temporary delay).")
     except Exception as e:
         st.error(f"Chart error for {symbol}: {e}")
 
-# Auto-refresh logic (at end to avoid multiple re-runs)
+# -------- Safe auto-refresh (no experimental API) ----------
 if st_autorefresh:
-    st.experimental_rerun()
+    time.sleep(15)
+    st.rerun()
