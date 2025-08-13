@@ -18,6 +18,8 @@ import numpy as np
 import pandas as pd
 import pytz
 from dotenv import load_dotenv
+from rl.bandit_selector import ContextualBandit
+from strategies.registry import ARMS, StratParams
 
 # ---------- Alpaca (alpaca-py) ----------
 from alpaca.trading.client import TradingClient
