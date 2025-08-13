@@ -1,0 +1,8 @@
+﻿alpaca-trade-api
+pandas
+numpy
+gymnasium
+stable-baselines3
+streamlit
+ta
+joblib
