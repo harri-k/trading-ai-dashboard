@@ -1,8 +1,7 @@
-﻿alpaca-trade-api
+streamlit
+alpaca-py
+python-dotenv
 pandas
 numpy
-gymnasium
-stable-baselines3
-streamlit
-ta
-joblib
+pytz
+plotly
