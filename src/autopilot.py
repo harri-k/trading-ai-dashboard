@@ -6,7 +6,7 @@
 # - Fractional LONGs allowed (via notional); SHORTs are whole-share only
 # - Per-trade dollar cap, max concurrent positions, daily/weekly drawdown halts
 # - Entry windows and symbol sanitation
-# - Minimal "ML" gate stub you can replace later
+# - Bandit-based per-trade parameter selection (Step 1)
 # ------------------------------------------------------------
 
 import os, time, math, logging
@@ -18,6 +18,8 @@ import numpy as np
 import pandas as pd
 import pytz
 from dotenv import load_dotenv
+
+# ---- Bandit + strategy presets ----
 from rl.bandit_selector import ContextualBandit
 from strategies.registry import ARMS, StratParams
 
@@ -30,8 +32,17 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 # ========== Config / ENV loading ==========
-ROOT = Path(__file__).resolve().parents[1]         # project root (C:\TradingAI)
-ENV_PATH = ROOT / "config" / ".env.paper"          # config\.env.paper
+# Auto-locate .env.paper anywhere under project root
+ROOT = Path(__file__).resolve().parents[1]  # project root
+ENV_PATH = None
+for p in ROOT.rglob(".env.paper"):
+    ENV_PATH = p
+    break
+
+if not ENV_PATH or not ENV_PATH.exists():
+    raise SystemExit("[CONFIG] Could not find .env.paper in project folder tree")
+
+# Load env vars
 load_dotenv(dotenv_path=str(ENV_PATH), override=True)
 
 def _get(name, default=None, cast=None):
@@ -65,7 +76,7 @@ SYMBOLS = _parse_symbols(_get("SYMBOLS", "SPY,AAPL,MSFT,QQQ"))
 TZNAME  = _get("MARKET_TIMEZONE", "America/New_York")
 NY      = pytz.timezone(TZNAME)
 
-# Strategy knobs
+# Strategy defaults (used as fallbacks; bandit arms can override per-trade)
 SCALP_EMA_FAST  = int(_get("SCALP_EMA_FAST", 4))
 SCALP_EMA_SLOW  = int(_get("SCALP_EMA_SLOW", 18))
 SCALP_BB_WINDOW = int(_get("SCALP_BB_WINDOW", 20))
@@ -106,6 +117,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
+
 def log(msg):
     print(msg, flush=True)
     logging.info(msg)
@@ -113,6 +125,13 @@ def log(msg):
 # ========== Alpaca clients ==========
 trading = TradingClient(API_KEY, API_SEC, paper=True)
 dataapi = StockHistoricalDataClient(API_KEY, API_SEC)
+
+# ========== Bandit init (persisted) ==========
+MODELS_DIR = ROOT / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+BANDIT_STORE = MODELS_DIR / "bandit_state.json"
+bandit = ContextualBandit.load(store=BANDIT_STORE, arms=[a.name for a in ARMS])
+ARM_BY_NAME = {a.name: a for a in ARMS}
 
 # ========== Time helpers ==========
 def now_ny():
@@ -144,7 +163,8 @@ def fetch_minute_bars(symbol: str, minutes: int = 400):
         timeframe=TimeFrame.Minute,
         start=start,
         end=end,
-        limit=minutes + 5
+        limit=minutes + 5,
+        feed="iex"  # force free IEX feed to avoid SIP restrictions
     )
     bars = dataapi.get_stock_bars(req).df
     if bars is None or bars.empty:
@@ -158,19 +178,31 @@ def fetch_minute_bars(symbol: str, minutes: int = 400):
     df.rename(columns={"open":"o","high":"h","low":"l","close":"c","volume":"v"}, inplace=True)
     return df
 
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def compute_indicators(
+    df: pd.DataFrame,
+    ema_fast: int = None,
+    ema_slow: int = None,
+    bb_window: int = None,
+    bb_std: float = None
+) -> pd.DataFrame:
+    """Compute indicators with either provided params or global defaults."""
     if df.empty:
         return df
+    ef = ema_fast if ema_fast is not None else SCALP_EMA_FAST
+    es = ema_slow if ema_slow is not None else SCALP_EMA_SLOW
+    bw = bb_window if bb_window is not None else SCALP_BB_WINDOW
+    bs = bb_std   if bb_std   is not None else SCALP_BB_STD
+
     out = df.copy()
     # EMAs
-    out["ema_fast"] = out["c"].ewm(span=SCALP_EMA_FAST, adjust=False).mean()
-    out["ema_slow"] = out["c"].ewm(span=SCALP_EMA_SLOW, adjust=False).mean()
+    out["ema_fast"] = out["c"].ewm(span=ef, adjust=False).mean()
+    out["ema_slow"] = out["c"].ewm(span=es, adjust=False).mean()
     # Bollinger
-    ma = out["c"].rolling(SCALP_BB_WINDOW).mean()
-    sd = out["c"].rolling(SCALP_BB_WINDOW).std(ddof=0)
+    ma = out["c"].rolling(bw).mean()
+    sd = out["c"].rolling(bw).std(ddof=0)
     out["bb_mid"] = ma
-    out["bb_up"]  = ma + SCALP_BB_STD * sd
-    out["bb_dn"]  = ma - SCALP_BB_STD * sd
+    out["bb_up"]  = ma + bs * sd
+    out["bb_dn"]  = ma - bs * sd
     # ATR (simple)
     tr = pd.concat([
         (out["h"] - out["l"]),
@@ -192,7 +224,7 @@ def simple_prob_from_bands(c, bb_up, bb_dn) -> float:
     z = min(1.0, abs(c - mid) / half)  # [0..1]
     return float(0.4 + 0.6 * z)        # 0.4 at mid, ~1.0 at band
 
-def make_signal(prev, row):
+def make_signal(prev, row, ml_min_prob: float):
     # Long: bounce from/below lower band while short EMA > long EMA
     # Short: reject from/above upper band while short EMA < long EMA
     if any(pd.isna(row[["ema_fast","ema_slow","bb_up","bb_dn","atr","c"]])):
@@ -212,7 +244,7 @@ def make_signal(prev, row):
 
     # ML gate (stub): boost confidence when near bands
     p = simple_prob_from_bands(row["c"], row["bb_up"], row["bb_dn"])
-    if p < ML_MIN_PROB:
+    if p < ml_min_prob:
         return None
     return side, float(row["c"]), float(row["atr"]), p
 
@@ -235,9 +267,10 @@ def calc_qty(side: str, price: float, dollar_target: float):
         return 0, False
     return q, False
 
-def place_order(symbol: str, side: str, price: float, atr: float, equity: float):
+def place_order(symbol: str, side: str, price: float, atr: float, equity: float, dollar_cap_override: float = None):
     # hard cap; simple equity guard (you can replace with ATR-risk sizing later)
-    dollar_target = min(POS_DOLLARS_CAP, equity * 0.20)
+    cap = dollar_cap_override if dollar_cap_override is not None else POS_DOLLARS_CAP
+    dollar_target = min(cap, equity * 0.20)
     qty_or_notional, use_notional = calc_qty(side, price, dollar_target)
     if qty_or_notional == 0:
         log(f"[SKIP] {symbol} {side} qty=0 after fractional/short guards")
@@ -346,27 +379,48 @@ def main():
                 if open_positions_count() >= MAX_OPEN:
                     break
 
-                df = fetch_minute_bars(symbol, minutes=max(400, SCALP_BB_WINDOW * 4))
-                if df.empty or len(df) < max(SCALP_BB_WINDOW, SCALP_EMA_SLOW) + 5:
+                df_raw = fetch_minute_bars(symbol, minutes=max(400, SCALP_BB_WINDOW * 4))
+                if df_raw.empty or len(df_raw) < max(SCALP_BB_WINDOW, SCALP_EMA_SLOW) + 5:
                     continue
-                df = compute_indicators(df)
 
-                # Liquidity/volatility guard via ATR%
-                last = df.iloc[-1]
-                if last["c"] <= 0 or pd.isna(last["atr"]) or last["atr"] <= 0:
+                # --- quick pass with defaults to estimate ATR% for context bucketing ---
+                df_pre = compute_indicators(df_raw)
+                last_pre = df_pre.iloc[-1]
+                if last_pre["c"] <= 0 or pd.isna(last_pre["atr"]) or last_pre["atr"] <= 0:
                     continue
-                atr_pct = (last["atr"] / last["c"]) * 100.0
+                atr_pct = (last_pre["atr"] / last_pre["c"]) * 100.0
                 if atr_pct < ATR_PCT_MIN or atr_pct > ATR_PCT_MAX:
                     continue
 
-                side_pack = make_signal(df.iloc[-2], last)
-                if not side_pack:
-                    continue
+                # --- choose strategy arm from bandit for this context ---
+                arm_name = bandit.select(symbol, atr_pct)
+                params: StratParams = ARM_BY_NAME[arm_name]
+                log(f"[ARM] {symbol} -> {arm_name} (atr%={atr_pct:.2f})")
 
-                side, price, atr, prob = side_pack
-                placed = place_order(symbol, side, price, atr, eq)
+                # recompute indicators using the chosen arm params
+                df = compute_indicators(
+                    df_raw,
+                    ema_fast=params.ema_fast,
+                    ema_slow=params.ema_slow,
+                    bb_window=params.bb_window,
+                    bb_std=params.bb_std
+                )
+
+                last = df.iloc[-1]
+                prev = df.iloc[-2]
+
+                # signal using this arm's ML threshold
+                sig = make_signal(prev, last, ml_min_prob=params.ml_min_prob)
+                if not sig:
+                    continue
+                side, price, atr, prob = sig
+
+                placed = place_order(
+                    symbol, side, price, atr, eq,
+                    dollar_cap_override=params.dollar_cap
+                )
                 if placed:
-                    log(f"[SIGNAL] {symbol} {side} prob={prob:.2f} atr%={atr_pct:.2f}")
+                    log(f"[SIGNAL] {symbol} {side} arm={arm_name} prob={prob:.2f} atr%={atr_pct:.2f}")
 
             time.sleep(POLL_SECONDS)
 
